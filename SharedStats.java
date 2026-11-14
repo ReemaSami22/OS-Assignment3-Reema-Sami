@@ -14,7 +14,7 @@ class SharedStats {
         statsLock.lock();
         try {
             int tmp = contextSwitchCount;
-            Racewindow.pause();
+            RaceWindow.pause();
             contextSwitchCount = tmp + 1;
         } finally {
             statsLock.unlock();
@@ -25,7 +25,7 @@ class SharedStats {
         statsLock.lock();
         try {
             int tmp = completedProcessCount;
-            Racewindow.pause();
+            RaceWindow.pause();
             completedProcessCount = tmp + 1;
         } finally {
             statsLock.unlock();
@@ -36,7 +36,7 @@ class SharedStats {
         statsLock.lock();
         try {
             long tmp = totalServiceTime;
-            Racewindow.pause();
+            RaceWindow.pause();
             totalServiceTime = tmp + (long)ms;
         } finally {
             statsLock.unlock();

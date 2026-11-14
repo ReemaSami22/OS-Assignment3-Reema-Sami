@@ -4,8 +4,9 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.locks.ReentrantLock;
-private final ReentrantLock queueLock = new ReentrantLock();
+
 // ANSI Color Codes for enhanced terminal output (same as Assignment 1)
 class Colors {
     public static final String RESET = "\u001B[0m";
@@ -49,7 +50,6 @@ class Config {
 }
 
 // ⚠️ SHARED STATISTICS: updated by ALL the process threads at the same time ⚠️
-// (these are the three "features" you counted in Assignment 1: context switches, completed processes, time)
 class SharedStats {
     static int totalProcesses = 0;            // set once by main (never modified afterwards)
     static int totalCPUs = 0;                 // set once by main (never modified afterwards)
@@ -59,61 +59,89 @@ class SharedStats {
     // Number of times a CPU found the ready queue empty and polled it again (busy waiting). Must be 0 after Feature 3.
     static final java.util.concurrent.atomic.AtomicInteger busyWaitPolls = new java.util.concurrent.atomic.AtomicInteger(0);
 
-    // TODO Feature 2: declare the lock(s) protecting the three shared variables above here.
-    // Think about it: ONE lock for the three variables, or ONE lock PER variable? (you must justify it in MY_WORK.md)
+    // Feature 2: ONE lock PER variable.
+    // The three variables are independent (no operation needs two of them at the same time), so separate
+    // locks let threads update different counters in parallel instead of waiting for each other.
+    private static final ReentrantLock contextSwitchLock = new ReentrantLock();
+    private static final ReentrantLock completedLock = new ReentrantLock();
+    private static final ReentrantLock serviceTimeLock = new ReentrantLock();
 
     public static void incrementContextSwitch() {
-        // TODO Feature 2: protect this critical section
-        int tmp = contextSwitchCount;       // 1) read
-        RaceWindow.pause();                 //    <- another thread can read the SAME value here
-        contextSwitchCount = tmp + 1;       // 2) write  (one increment is lost if someone else did the same)
+        contextSwitchLock.lock();
+        try {
+            int tmp = contextSwitchCount;       // 1) read
+            RaceWindow.pause();                 //    <- another thread can no longer enter here
+            contextSwitchCount = tmp + 1;       // 2) write
+        } finally {
+            contextSwitchLock.unlock();         // always released, even if an exception is thrown
+        }
     }
 
     public static void incrementCompletedProcess() {
-        // TODO Feature 2: protect this critical section
-        int tmp = completedProcessCount;
-        RaceWindow.pause();
-        completedProcessCount = tmp + 1;
+        completedLock.lock();
+        try {
+            int tmp = completedProcessCount;
+            RaceWindow.pause();
+            completedProcessCount = tmp + 1;
+        } finally {
+            completedLock.unlock();
+        }
     }
 
     public static void addServiceTime(int ms) {
-        // TODO Feature 2: protect this critical section
-        long tmp = totalServiceTime;
-        RaceWindow.pause();
-        totalServiceTime = tmp + ms;
+        serviceTimeLock.lock();
+        try {
+            long tmp = totalServiceTime;
+            RaceWindow.pause();
+            totalServiceTime = tmp + ms;
+        } finally {
+            serviceTimeLock.unlock();
+        }
     }
 
-    // Readers must also be protected (a read in the middle of an update is not safe either)
+    // Readers are protected too (a read in the middle of an update is not safe either)
     public static int getCompletedProcessCount() {
-        // TODO Feature 2: protect this read
-        return completedProcessCount;
+        completedLock.lock();
+        try {
+            return completedProcessCount;
+        } finally {
+            completedLock.unlock();
+        }
     }
 
     public static int getContextSwitchCount() {
-        // TODO Feature 2: protect this read
-        return contextSwitchCount;
+        contextSwitchLock.lock();
+        try {
+            return contextSwitchCount;
+        } finally {
+            contextSwitchLock.unlock();
+        }
     }
 
     public static long getTotalServiceTime() {
-        // TODO Feature 2: protect this read
-        return totalServiceTime;
+        serviceTimeLock.lock();
+        try {
+            return totalServiceTime;
+        } finally {
+            serviceTimeLock.unlock();
+        }
     }
 }
 
 // ⚠️ THE READY QUEUE: shared by ALL the CPU threads ⚠️
-// In Assignment 1 only the main thread used the queue. Now several CPUs poll and re-enqueue processes
-// at the same time, so every access to `list` and `map` is a critical section.
 class ReadyQueue {
     private final LinkedList<Thread> list = new LinkedList<>();   // FIFO queue of threads
-    private final Map<Thread, Process> map = new HashMap<>();     // thread -> process (same idea as Assignment 1)
+    private final Map<Thread, Process> map = new HashMap<>();     // thread -> process
 
-    // TODO Feature 1: declare the lock protecting `list` and `map` here
-     private final ReentrantLock queueLock = new ReentrantLock();
-    // TODO Feature 3: declare the counting semaphore that counts the processes waiting in the ready queue here
+    // Feature 1: mutex lock protecting `list` and `map`
+    private final ReentrantLock queueLock = new ReentrantLock();
+
+    // Feature 3: counting semaphore = number of processes currently waiting in the ready queue.
+    // Initial value 0 because the queue is empty at the beginning; every add() will release() it.
+    final Semaphore readySemaphore = new Semaphore(0);
 
     // Add a process to the ready queue (new process, or a process that did not finish its quantum)
     public void add(Process process) {
-        // TODO Feature 1: protect this critical section
         queueLock.lock();
         try {
             Thread thread = new Thread(process);
@@ -122,8 +150,8 @@ class ReadyQueue {
         } finally {
             queueLock.unlock();
         }
-        
-        // TODO Feature 3: signal that one more process is available in the queue
+
+        // Feature 3: signal that one more process is available (done AFTER releasing the lock)
         readySemaphore.release();
 
         System.out.println(Colors.BLUE + "  ➕ " + Colors.BOLD + Colors.CYAN + process.getName() + Colors.RESET +
@@ -134,46 +162,40 @@ class ReadyQueue {
 
     // Remove and return the thread at the head of the queue (or null if the queue is empty)
     public Thread poll() {
-    // // TODO Feature 1: protect this critical section
-    queueLock.lock();
-    try {
-        if (list.isEmpty()) {
-            return null;
+        queueLock.lock();
+        try {
+            if (list.isEmpty()) {
+                return null;
+            }
+            return list.poll();      // return inside try: finally still releases the lock
+        } finally {
+            queueLock.unlock();
         }
-        Thread thread = list.poll();
-        map.remove(thread);
-        return thread;
-    } finally {
-        queueLock.unlock();
     }
-}
-    
 
     public Process processOf(Thread thread) {
-    // // TODO Feature 1: protect this access
-    queueLock.lock();
-    try {
-        return map.get(thread);
-    } finally {
-        queueLock.unlock();
+        queueLock.lock();
+        try {
+            return map.get(thread);
+        } finally {
+            queueLock.unlock();
+        }
     }
-}
 
     // Names of the processes currently waiting in the queue (used to display the ready queue)
     public String snapshot() {
-    // // TODO Feature 1: protect this critical section
-    queueLock.lock();
-    try {
-        StringBuilder sb = new StringBuilder();
-        for (Thread t : list) {
-            if (sb.length() > 0) sb.append(" -> ");
-            sb.append(map.get(t).getName());
+        queueLock.lock();
+        try {
+            StringBuilder sb = new StringBuilder();
+            for (Thread t : list) {
+                if (sb.length() > 0) sb.append(" -> ");
+                sb.append(map.get(t).getName());
+            }
+            return sb.length() == 0 ? "empty" : sb.toString();
+        } finally {
+            queueLock.unlock();
         }
-        return sb.length() == 0 ? "empty" : sb.toString();
-    } finally {
-        queueLock.unlock();
     }
-
 }
 
 // Class representing a process (same as Assignment 1) - executes ONE time quantum per thread start
@@ -182,8 +204,8 @@ class Process implements Runnable {
     private final int burstTime;           // total CPU time needed (nominal ms)
     private final int timeQuantum;         // maximum time per CPU access (nominal ms)
     private int remainingTime;
-    private final int priority;            // Assignment 1 - Feature 1: priority 1..10 (10 = highest), display only
-    private final long creationTime;       // Assignment 1 - Feature 3: for waiting / turnaround time
+    private final int priority;            // priority 1..10 (10 = highest), display only
+    private final long creationTime;       // for waiting / turnaround time
     private long completionTime = 0;
     private volatile int cpuId = 0;        // the CPU thread that is currently running this process
 
@@ -204,10 +226,10 @@ class Process implements Runnable {
     public void run() {
         int runTime = Math.min(timeQuantum, remainingTime);
 
-        // Assignment 1 - Feature 2: a context switch happens every time a process starts running on a CPU
+        // a context switch happens every time a process starts running on a CPU
         SharedStats.incrementContextSwitch();
 
-        System.out.println(Colors.BRIGHT_GREEN + "  ▶ [CPU-" + cpuId + "] " + Colors.BOLD + Colors.CYAN + name +
+        System.out.println(Colors.BRIGHT_GREEN + "  ▶️ [CPU-" + cpuId + "] " + Colors.BOLD + Colors.CYAN + name +
                 Colors.RESET + Colors.GREEN + " (Priority: " + priority + ") executing quantum" + Colors.RESET +
                 " [" + runTime + "ms]");
 
@@ -265,8 +287,6 @@ class Process implements Runnable {
 }
 
 // A CPU of the simulated machine: takes a process from the shared ready queue, runs ONE quantum, and repeats.
-// (In Assignment 1 this loop was executed by the main thread: now several CPUs execute it at the same time.)
-public static final java.util.concurrent.Semaphore readySemaphore = new java.util.concurrent.Semaphore(0);
 class CpuWorker extends Thread {
     private final int cpuId;
     private final ReadyQueue readyQueue;
@@ -279,21 +299,25 @@ class CpuWorker extends Thread {
 
     @Override
     public void run() {
-        while (SharedStats.getCompletedProcessCount() < SharedStats.totalProcesses) {
-            
-            // Feature 3: Replace busy-waiting with Semaphore acquire
+        while (true) {
+            // Feature 3: block (no polling, no CPU wasted) until at least one process is in the ready queue.
+            // Important: we do NOT hold any lock while waiting on the semaphore (that would cause a deadlock).
             try {
-                readySemaphore.acquire();
+                readyQueue.readySemaphore.acquire();
             } catch (InterruptedException e) {
+                System.out.println("CPU-" + cpuId + " interrupted.");
+                return;
+            }
+
+            // Woken up by the shutdown signal (all processes completed): stop instead of polling the queue
+            if (SharedStats.getCompletedProcessCount() >= SharedStats.totalProcesses) {
                 return;
             }
 
             Thread thread = readyQueue.poll();
-            if (thread != null) {
-             
+            if (thread == null) {
+                continue;                        // should not happen: the semaphore counts real processes
             }
-        
-    }
 
             Process process = readyQueue.processOf(thread);
             System.out.println(Colors.MAGENTA + "  ┌─ [CPU-" + cpuId + "] picks " + Colors.BRIGHT_CYAN +
@@ -309,11 +333,15 @@ class CpuWorker extends Thread {
             }
 
             if (!process.isFinished()) {
-                readyQueue.add(process);         // not finished: back to the ready queue
+                readyQueue.add(process);         // not finished: back to the ready queue (add() releases the semaphore)
             }
 
-            // TODO Feature 3: when the LAST process has completed, wake up the CPUs that are blocked on the
-            // semaphore so that they can terminate (otherwise they would wait forever!)
+            // Feature 3 (clean shutdown): when the LAST process has completed, wake up ALL the CPUs that are
+            // blocked on the semaphore so that they can terminate (otherwise they would wait forever!)
+            if (SharedStats.getCompletedProcessCount() >= SharedStats.totalProcesses) {
+                readyQueue.readySemaphore.release(SharedStats.totalCPUs);
+                return;
+            }
         }
     }
 }
@@ -354,7 +382,7 @@ public class SchedulerSimulationSync {
 
         System.out.println("\n" + Colors.BOLD + Colors.GREEN + "╔════════════════════════════════════════════════════════════════════════════════╗" + Colors.RESET);
         System.out.println(Colors.BOLD + Colors.GREEN + "║" + Colors.RESET + Colors.BG_GREEN + Colors.WHITE + Colors.BOLD +
-                "                  ▶  " + numCPUs + " CPUs STARTING (CONCURRENT SCHEDULER)  ◀                    " +
+                "                  ▶️  " + numCPUs + " CPUs STARTING (CONCURRENT SCHEDULER)  ◀️                    " +
                 Colors.RESET + Colors.BOLD + Colors.GREEN + "║" + Colors.RESET);
         System.out.println(Colors.BOLD + Colors.GREEN + "╚════════════════════════════════════════════════════════════════════════════════╝" + Colors.RESET + "\n");
 
